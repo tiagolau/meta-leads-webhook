@@ -67,14 +67,50 @@ function verifySignature(rawBody, signatureHeader) {
   return crypto.timingSafeEqual(a, b);
 }
 
+const LEAD_FIELDS = [
+  'id',
+  'created_time',
+  'field_data',
+  'ad_id',
+  'ad_name',
+  'adset_id',
+  'adset_name',
+  'campaign_id',
+  'campaign_name',
+  'form_id',
+  'is_organic',
+  'partner_name',
+  'platform',
+  'custom_disclaimer_responses',
+].join(',');
+
 async function fetchLead(leadgenId) {
-  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${leadgenId}?access_token=${META_PAGE_TOKEN}`;
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${leadgenId}?fields=${LEAD_FIELDS}&access_token=${META_PAGE_TOKEN}`;
   const res = await fetch(url);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Graph API ${res.status}: ${text}`);
   }
   return res.json();
+}
+
+const formNameCache = new Map();
+const FORM_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function fetchFormName(formId) {
+  if (!formId) return null;
+  const cached = formNameCache.get(formId);
+  if (cached && Date.now() - cached.ts < FORM_CACHE_TTL_MS) return cached.name;
+  try {
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${formId}?fields=name&access_token=${META_PAGE_TOKEN}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    formNameCache.set(formId, { name: data.name, ts: Date.now() });
+    return data.name;
+  } catch {
+    return null;
+  }
 }
 
 function flattenFields(fieldData = []) {
@@ -114,15 +150,24 @@ async function processLeadgen(change, logger) {
 
   const lead = await fetchLead(leadgen_id);
   const fields = flattenFields(lead.field_data);
+  const resolvedFormId = lead.form_id || form_id;
+  const formName = await fetchFormName(resolvedFormId);
 
   const payload = {
     leadgen_id: lead.id,
     created_time: lead.created_time || created_time,
     page_id,
-    form_id,
-    ad_id,
-    adgroup_id,
-    campaign_id,
+    form_id: resolvedFormId,
+    form_name: formName,
+    ad_id: lead.ad_id || ad_id,
+    ad_name: lead.ad_name || null,
+    adset_id: lead.adset_id || adgroup_id,
+    adset_name: lead.adset_name || null,
+    campaign_id: lead.campaign_id || campaign_id,
+    campaign_name: lead.campaign_name || null,
+    platform: lead.platform || null,
+    is_organic: lead.is_organic ?? null,
+    partner_name: lead.partner_name || null,
     name: fields.full_name || fields.name || '',
     email: fields.email || '',
     phone: fields.phone_number || fields.phone || '',
@@ -131,7 +176,15 @@ async function processLeadgen(change, logger) {
   };
 
   logger.info(
-    { leadgen_id, form_id, name: payload.name, phone: payload.phone },
+    {
+      leadgen_id,
+      form_id: resolvedFormId,
+      form_name: formName,
+      campaign_name: payload.campaign_name,
+      ad_name: payload.ad_name,
+      name: payload.name,
+      phone: payload.phone,
+    },
     'received lead',
   );
 
