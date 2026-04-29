@@ -1,0 +1,17 @@
+{
+  "name": "meta-leads-webhook",
+  "version": "1.0.0",
+  "description": "Webhook Meta Lead Ads -> DataCrazy CRM (Faculeste)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0"
+  }
+}
