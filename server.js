@@ -1,5 +1,7 @@
 import Fastify from 'fastify';
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
 const {
   META_APP_SECRET,
@@ -9,6 +11,10 @@ const {
   GRAPH_API_VERSION = 'v21.0',
   PORT = 3000,
   LOG_LEVEL = 'info',
+  POLLING_ENABLED = 'true',
+  POLLING_INTERVAL_MS = '120000',
+  POLLING_PAGE_ID = '556406854837637',
+  STATE_DIR = '/app/state',
 } = process.env;
 
 for (const [k, v] of Object.entries({
@@ -113,6 +119,32 @@ async function fetchFormName(formId) {
   }
 }
 
+async function listActiveForms() {
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${POLLING_PAGE_ID}/leadgen_forms?fields=id,name,status&limit=200&access_token=${META_PAGE_TOKEN}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`leadgen_forms ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  return (data.data || []).filter((f) => f.status === 'ACTIVE');
+}
+
+async function fetchLeadsSince(formId, sinceTimestamp) {
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${formId}/leads?fields=${LEAD_FIELDS}&limit=50&access_token=${META_PAGE_TOKEN}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`leads(${formId}) ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  const leads = data.data || [];
+  return leads.filter((l) => {
+    const ts = Math.floor(new Date(l.created_time).getTime() / 1000);
+    return ts > sinceTimestamp;
+  });
+}
+
 function flattenFields(fieldData = []) {
   const out = {};
   for (const f of fieldData) {
@@ -134,36 +166,22 @@ async function sendToDataCrazy(payload, logger) {
   logger.info({ status: res.status, response: text.slice(0, 200) }, 'forwarded to datacrazy');
 }
 
-async function processLeadgen(change, logger) {
-  const { leadgen_id, page_id, form_id, created_time, ad_id, adgroup_id, campaign_id } =
-    change.value || {};
-
-  if (!leadgen_id) {
-    logger.warn({ change }, 'change without leadgen_id');
-    return;
-  }
-
-  if (alreadyProcessed(leadgen_id)) {
-    logger.info({ leadgen_id }, 'duplicate skipped');
-    return;
-  }
-
-  const lead = await fetchLead(leadgen_id);
+async function buildPayload(lead, source, fallback = {}) {
   const fields = flattenFields(lead.field_data);
-  const resolvedFormId = lead.form_id || form_id;
-  const formName = await fetchFormName(resolvedFormId);
+  const formId = lead.form_id || fallback.form_id;
+  const formName = await fetchFormName(formId);
 
-  const payload = {
+  return {
     leadgen_id: lead.id,
-    created_time: lead.created_time || created_time,
-    page_id,
-    form_id: resolvedFormId,
+    created_time: lead.created_time || fallback.created_time,
+    page_id: fallback.page_id || POLLING_PAGE_ID,
+    form_id: formId,
     form_name: formName,
-    ad_id: lead.ad_id || ad_id,
+    ad_id: lead.ad_id || fallback.ad_id || null,
     ad_name: lead.ad_name || null,
-    adset_id: lead.adset_id || adgroup_id,
+    adset_id: lead.adset_id || fallback.adgroup_id || null,
     adset_name: lead.adset_name || null,
-    campaign_id: lead.campaign_id || campaign_id,
+    campaign_id: lead.campaign_id || fallback.campaign_id || null,
     campaign_name: lead.campaign_name || null,
     platform: lead.platform || null,
     is_organic: lead.is_organic ?? null,
@@ -173,22 +191,147 @@ async function processLeadgen(change, logger) {
     phone: fields.phone_number || fields.phone || '',
     fields,
     raw_field_data: lead.field_data,
+    _source: source,
   };
+}
+
+async function processLead(lead, source, logger, fallback = {}) {
+  if (alreadyProcessed(lead.id)) {
+    logger.info({ leadgen_id: lead.id, source }, 'duplicate skipped');
+    return false;
+  }
+
+  const payload = await buildPayload(lead, source, fallback);
 
   logger.info(
     {
-      leadgen_id,
-      form_id: resolvedFormId,
-      form_name: formName,
+      leadgen_id: lead.id,
+      form_id: payload.form_id,
+      form_name: payload.form_name,
       campaign_name: payload.campaign_name,
       ad_name: payload.ad_name,
       name: payload.name,
       phone: payload.phone,
+      source,
     },
     'received lead',
   );
 
   await sendToDataCrazy(payload, logger);
+  return true;
+}
+
+async function processLeadgen(change, logger) {
+  const { leadgen_id } = change.value || {};
+  if (!leadgen_id) {
+    logger.warn({ change }, 'change without leadgen_id');
+    return;
+  }
+  if (alreadyProcessed(leadgen_id)) {
+    logger.info({ leadgen_id, source: 'webhook' }, 'duplicate skipped');
+    return;
+  }
+  seenLeadIds.delete(leadgen_id);
+  const lead = await fetchLead(leadgen_id);
+  await processLead(lead, 'webhook', logger, change.value);
+}
+
+const checkpointPath = path.join(STATE_DIR, 'checkpoint.json');
+
+async function loadCheckpoint() {
+  try {
+    const data = await fs.readFile(checkpointPath, 'utf8');
+    return JSON.parse(data);
+  } catch {
+    return {};
+  }
+}
+
+async function saveCheckpoint(state) {
+  await fs.mkdir(STATE_DIR, { recursive: true });
+  await fs.writeFile(checkpointPath, JSON.stringify(state, null, 2));
+}
+
+let pollingInFlight = false;
+
+async function pollOnce() {
+  if (pollingInFlight) {
+    app.log.info('previous poll still in flight, skipping');
+    return;
+  }
+  pollingInFlight = true;
+  try {
+    const state = await loadCheckpoint();
+    const forms = await listActiveForms();
+    const nowSec = Math.floor(Date.now() / 1000);
+    let totalNew = 0;
+
+    for (const form of forms) {
+      const since = state[form.id] || nowSec;
+      let leads;
+      try {
+        leads = await fetchLeadsSince(form.id, since);
+      } catch (err) {
+        app.log.error({ form_id: form.id, err: err.message }, 'poll fetch error');
+        continue;
+      }
+      if (!leads.length) continue;
+
+      leads.sort(
+        (a, b) => new Date(a.created_time).getTime() - new Date(b.created_time).getTime(),
+      );
+
+      for (const lead of leads) {
+        try {
+          const sent = await processLead(lead, 'poll', app.log);
+          if (sent) totalNew++;
+        } catch (err) {
+          app.log.error(
+            { leadgen_id: lead.id, err: err.message },
+            'poll process error',
+          );
+          continue;
+        }
+        const ts = Math.floor(new Date(lead.created_time).getTime() / 1000);
+        state[form.id] = Math.max(state[form.id] || 0, ts);
+        await saveCheckpoint(state);
+      }
+    }
+    if (totalNew > 0) app.log.info({ totalNew }, 'poll cycle complete');
+  } finally {
+    pollingInFlight = false;
+  }
+}
+
+async function startPolling() {
+  if (POLLING_ENABLED !== 'true') {
+    app.log.info('polling disabled');
+    return;
+  }
+  const state = await loadCheckpoint();
+  if (Object.keys(state).length === 0) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+      const forms = await listActiveForms();
+      const initial = {};
+      for (const form of forms) initial[form.id] = nowSec;
+      await saveCheckpoint(initial);
+      app.log.info({ forms: forms.length, cutoff: nowSec }, 'initialized checkpoint');
+    } catch (err) {
+      app.log.error({ err: err.message }, 'failed to initialize checkpoint');
+    }
+  }
+  app.log.info({ interval_ms: Number(POLLING_INTERVAL_MS) }, 'polling enabled');
+  const tick = async () => {
+    try {
+      await pollOnce();
+    } catch (err) {
+      app.log.error({ err: err.message }, 'poll tick failed');
+    } finally {
+      setTimeout(tick, Number(POLLING_INTERVAL_MS));
+    }
+  };
+  setTimeout(tick, 5000);
 }
 
 app.get('/health', async () => ({ ok: true, ts: new Date().toISOString() }));
@@ -234,4 +377,5 @@ app.post('/webhook/leads', async (req, reply) => {
 
 app.listen({ port: Number(PORT), host: '0.0.0.0' }).then(() => {
   app.log.info(`meta-leads-webhook listening on :${PORT}`);
+  startPolling();
 });

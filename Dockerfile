@@ -7,6 +7,8 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY server.js ./
 
+RUN mkdir -p /app/state
+
 ENV NODE_ENV=production
 ENV PORT=3000
 
