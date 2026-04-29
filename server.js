@@ -28,21 +28,20 @@ const app = Fastify({
   bodyLimit: 1024 * 1024,
 });
 
-await app.register(async (fastify) => {
-  fastify.addContentTypeParser(
-    'application/json',
-    { parseAs: 'buffer' },
-    (req, body, done) => {
-      req.rawBody = body;
-      try {
-        done(null, body.length ? JSON.parse(body.toString('utf8')) : {});
-      } catch (err) {
-        err.statusCode = 400;
-        done(err, undefined);
-      }
-    },
-  );
-});
+app.removeContentTypeParser('application/json');
+app.addContentTypeParser(
+  'application/json',
+  { parseAs: 'buffer' },
+  (req, body, done) => {
+    req.rawBody = body;
+    try {
+      done(null, body.length ? JSON.parse(body.toString('utf8')) : {});
+    } catch (err) {
+      err.statusCode = 400;
+      done(err, undefined);
+    }
+  },
+);
 
 const seenLeadIds = new Map();
 const SEEN_TTL_MS = 60 * 60 * 1000;
