@@ -15,6 +15,9 @@ const {
   POLLING_INTERVAL_MS = '120000',
   POLLING_PAGE_ID = '556406854837637',
   STATE_DIR = '/app/state',
+  META_DATASETS = '{}',
+  META_STAGE_MAP = '{}',
+  CAPI_INBOUND_SECRET,
 } = process.env;
 
 for (const [k, v] of Object.entries({
@@ -28,6 +31,35 @@ for (const [k, v] of Object.entries({
     process.exit(1);
   }
 }
+
+let datasetsByPage;
+try {
+  datasetsByPage = JSON.parse(META_DATASETS);
+} catch (err) {
+  console.error('META_DATASETS is not valid JSON:', err.message);
+  process.exit(1);
+}
+
+const DEFAULT_STAGE_MAP = {
+  lead: 'Lead',
+  novo: 'Lead',
+  contato: 'Contact',
+  contatado: 'Contact',
+  agendado: 'Schedule',
+  qualificado: 'Qualified Lead',
+  inscrito: 'SubmitApplication',
+  matriculado: 'Converted Lead',
+  convertido: 'Converted Lead',
+};
+
+let customStageMap;
+try {
+  customStageMap = JSON.parse(META_STAGE_MAP);
+} catch (err) {
+  console.error('META_STAGE_MAP is not valid JSON:', err.message);
+  process.exit(1);
+}
+const stageMap = { ...DEFAULT_STAGE_MAP, ...customStageMap };
 
 const app = Fastify({
   logger: { level: LOG_LEVEL },
@@ -202,6 +234,7 @@ async function processLead(lead, source, logger, fallback = {}) {
   }
 
   const payload = await buildPayload(lead, source, fallback);
+  await rememberLeadPage(lead.id, payload.page_id);
 
   logger.info(
     {
@@ -237,6 +270,7 @@ async function processLeadgen(change, logger) {
 }
 
 const checkpointPath = path.join(STATE_DIR, 'checkpoint.json');
+const leadPagesPath = path.join(STATE_DIR, 'lead-pages.json');
 
 async function loadCheckpoint() {
   try {
@@ -250,6 +284,35 @@ async function loadCheckpoint() {
 async function saveCheckpoint(state) {
   await fs.mkdir(STATE_DIR, { recursive: true });
   await fs.writeFile(checkpointPath, JSON.stringify(state, null, 2));
+}
+
+const leadPages = new Map();
+let leadPagesLoaded = false;
+
+async function loadLeadPages() {
+  try {
+    const data = await fs.readFile(leadPagesPath, 'utf8');
+    const obj = JSON.parse(data);
+    for (const [k, v] of Object.entries(obj)) leadPages.set(k, v);
+  } catch {}
+  leadPagesLoaded = true;
+}
+
+async function persistLeadPages() {
+  await fs.mkdir(STATE_DIR, { recursive: true });
+  const obj = Object.fromEntries(leadPages);
+  await fs.writeFile(leadPagesPath, JSON.stringify(obj));
+}
+
+async function rememberLeadPage(leadgenId, pageId) {
+  if (!leadgenId || !pageId) return;
+  if (leadPages.get(leadgenId) === pageId) return;
+  leadPages.set(leadgenId, pageId);
+  try {
+    await persistLeadPages();
+  } catch (err) {
+    app.log.error({ err: err.message }, 'failed to persist lead-pages');
+  }
 }
 
 let pollingInFlight = false;
@@ -375,7 +438,142 @@ app.post('/webhook/leads', async (req, reply) => {
   });
 });
 
-app.listen({ port: Number(PORT), host: '0.0.0.0' }).then(() => {
+function normalizeStage(stage) {
+  return String(stage || '').trim().toLowerCase();
+}
+
+function resolveEventName(stage) {
+  const key = normalizeStage(stage);
+  if (!key) return null;
+  if (Object.prototype.hasOwnProperty.call(stageMap, key)) return stageMap[key];
+  return null;
+}
+
+async function sendCapiLeadEvent({ leadgenId, eventName, eventTimeSec, datasetCfg, logger }) {
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${datasetCfg.dataset_id}/events?access_token=${datasetCfg.access_token}`;
+  const body = {
+    data: [
+      {
+        event_name: eventName,
+        event_time: eventTimeSec,
+        event_id: `${leadgenId}-${eventName}-${eventTimeSec}`,
+        action_source: 'system_generated',
+        user_data: {
+          lead_id: Number(leadgenId),
+        },
+        custom_data: {
+          event_source: 'crm',
+          lead_event_source: datasetCfg.crm_name || 'DataCrazy',
+        },
+      },
+    ],
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {}
+  if (!res.ok) {
+    logger.error(
+      { status: res.status, body: text.slice(0, 400), leadgen_id: leadgenId, event_name: eventName },
+      'CAPI lead event failed',
+    );
+    const err = new Error(`Meta ${res.status}`);
+    err.statusCode = res.status;
+    err.meta = parsed;
+    throw err;
+  }
+  logger.info(
+    {
+      leadgen_id: leadgenId,
+      event_name: eventName,
+      events_received: parsed?.events_received,
+      fbtrace_id: parsed?.fbtrace_id,
+    },
+    'CAPI lead event sent',
+  );
+  return parsed;
+}
+
+app.post('/capi/lead-event', async (req, reply) => {
+  if (!CAPI_INBOUND_SECRET) {
+    return reply.code(503).send({ error: 'capi inbound disabled' });
+  }
+  const auth = req.headers.authorization || '';
+  const expected = `Bearer ${CAPI_INBOUND_SECRET}`;
+  if (auth.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+
+  const { leadgen_id, stage, occurred_at, page_id: pageIdHint } = req.body || {};
+  if (!leadgen_id || !stage) {
+    return reply.code(400).send({ error: 'leadgen_id and stage are required' });
+  }
+
+  const eventName = resolveEventName(stage);
+  if (!eventName) {
+    req.log.info({ leadgen_id, stage }, 'stage not mapped, skipping');
+    return reply.code(202).send({ ok: true, skipped: 'stage_unmapped', stage });
+  }
+
+  if (!leadPagesLoaded) await loadLeadPages();
+  const pageId = pageIdHint || leadPages.get(String(leadgen_id));
+  if (!pageId) {
+    return reply.code(404).send({ error: 'page mapping not found for leadgen_id' });
+  }
+
+  const datasetCfg = datasetsByPage[pageId];
+  if (!datasetCfg?.dataset_id || !datasetCfg?.access_token) {
+    return reply.code(412).send({ error: 'no dataset configured for page', page_id: pageId });
+  }
+
+  const eventTimeSec = occurred_at
+    ? Math.floor(new Date(occurred_at).getTime() / 1000)
+    : Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(eventTimeSec) || eventTimeSec <= 0) {
+    return reply.code(400).send({ error: 'invalid occurred_at' });
+  }
+
+  try {
+    const result = await sendCapiLeadEvent({
+      leadgenId: leadgen_id,
+      eventName,
+      eventTimeSec,
+      datasetCfg,
+      logger: req.log,
+    });
+    return reply.code(200).send({
+      ok: true,
+      event_name: eventName,
+      dataset_id: datasetCfg.dataset_id,
+      page_id: pageId,
+      events_received: result?.events_received ?? null,
+      fbtrace_id: result?.fbtrace_id ?? null,
+    });
+  } catch (err) {
+    return reply.code(502).send({
+      error: 'meta capi failed',
+      status: err.statusCode || null,
+      details: err.meta || null,
+    });
+  }
+});
+
+app.listen({ port: Number(PORT), host: '0.0.0.0' }).then(async () => {
   app.log.info(`meta-leads-webhook listening on :${PORT}`);
+  await loadLeadPages();
+  app.log.info(
+    {
+      lead_pages: leadPages.size,
+      datasets: Object.keys(datasetsByPage).length,
+      capi_enabled: !!CAPI_INBOUND_SECRET && Object.keys(datasetsByPage).length > 0,
+    },
+    'state ready',
+  );
   startPolling();
 });
