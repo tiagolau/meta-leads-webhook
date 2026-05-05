@@ -32,6 +32,15 @@ for (const [k, v] of Object.entries({
   }
 }
 
+const datacrazyWebhookUrls = DATACRAZY_WEBHOOK_URL
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (!datacrazyWebhookUrls.length) {
+  console.error('DATACRAZY_WEBHOOK_URL must contain at least one URL');
+  process.exit(1);
+}
+
 let datasetsByPage;
 try {
   datasetsByPage = JSON.parse(META_DATASETS);
@@ -185,17 +194,47 @@ function flattenFields(fieldData = []) {
   return out;
 }
 
-async function sendToDataCrazy(payload, logger) {
-  const res = await fetch(DATACRAZY_WEBHOOK_URL, {
+async function postWebhook(url, payload) {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`DataCrazy ${res.status}: ${text}`);
+    const err = new Error(`DataCrazy ${res.status}: ${text}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
   }
-  logger.info({ status: res.status, response: text.slice(0, 200) }, 'forwarded to datacrazy');
+  return { status: res.status, body: text };
+}
+
+async function sendToDataCrazy(payload, logger) {
+  const results = await Promise.allSettled(
+    datacrazyWebhookUrls.map((url) => postWebhook(url, payload)),
+  );
+
+  let okCount = 0;
+  results.forEach((r, i) => {
+    const url = datacrazyWebhookUrls[i];
+    if (r.status === 'fulfilled') {
+      okCount++;
+      logger.info(
+        { url, status: r.value.status, response: r.value.body.slice(0, 200) },
+        'forwarded to datacrazy',
+      );
+    } else {
+      logger.error(
+        { url, err: r.reason?.message, status: r.reason?.status },
+        'datacrazy webhook failed',
+      );
+    }
+  });
+
+  if (okCount === 0) {
+    throw new Error('all datacrazy webhooks failed');
+  }
 }
 
 async function buildPayload(lead, source, fallback = {}) {
